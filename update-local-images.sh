@@ -105,6 +105,16 @@ ensure_repo_root() {
     log_error "Place this file in the cliproxyapi-dashboard repo root"
     exit 1
   fi
+  
+  if ! command -v git >/dev/null 2>&1; then
+    log_error "git not found"
+    exit 1
+  fi
+
+  if ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    log_error "$SCRIPT_DIR is not a Git repository"
+    exit 1
+  fi
 }
 
 bootstrap_if_needed() {
@@ -119,6 +129,11 @@ bootstrap_if_needed() {
 
 sidecar_enabled() {
   [[ -f "$ENV_FILE" ]] && grep -Eq '^COMPOSE_PROFILES=.*(^|,)perplexity(,|$)|^COMPOSE_PROFILES=perplexity$' "$ENV_FILE"
+}
+
+compose_has_service() {
+  docker compose -f "$COMPOSE_FILE" config --services |
+    grep -Fxq "$1"
 }
 
 build_services() {
@@ -136,6 +151,10 @@ build_services() {
       ;;
   esac
 
+  if [[ "$MODE" != "proxy" ]] && compose_has_service usage-collector; then
+    services+=(usage-collector)
+  fi
+
   if [[ "$WITH_SIDECAR" -eq 1 ]]; then
     services+=(perplexity-sidecar)
   fi
@@ -144,15 +163,37 @@ build_services() {
 }
 
 compose_pull() {
-  local services=("$@")
-  log_info "Pulling latest images: ${services[*]}"
-  docker compose -f "$COMPOSE_FILE" pull "${services[@]}"
+  local requested=("$@")
+  local pullable=()
+  local service
+
+  for service in "${requested[@]}"; do
+    case "$service" in
+      cliproxyapi|usage-collector)
+        pullable+=("$service")
+        ;;
+      dashboard|perplexity-sidecar)
+        log_info "$service is built from local source; skipping image pull"
+        ;;
+    esac
+  done
+
+  if [[ "${#pullable[@]}" -gt 0 ]]; then
+    log_info "Pulling images: ${pullable[*]}"
+    docker compose -f "$COMPOSE_FILE" pull "${pullable[@]}"
+  fi
 }
 
 compose_up() {
   local services=("$@")
-  log_info "Recreating containers: ${services[*]}"
-  docker compose -f "$COMPOSE_FILE" up -d --no-deps "${services[@]}"
+
+  log_info "Building and recreating containers: ${services[*]}"
+
+  docker compose -f "$COMPOSE_FILE" up -d \
+    --build \
+    --force-recreate \
+    --no-deps \
+    "${services[@]}"
 }
 
 show_status() {
@@ -169,6 +210,9 @@ main() {
   fi
 
   bootstrap_if_needed
+
+  log_info "Updating repository source"
+  git -C "$SCRIPT_DIR" pull --ff-only
 
   mapfile -t services < <(build_services)
 
